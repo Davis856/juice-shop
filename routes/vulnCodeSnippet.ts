@@ -10,6 +10,16 @@ import { getCodeChallenges } from '../lib/codingChallenges'
 import * as accuracy from '../lib/accuracy'
 import * as utils from '../lib/utils'
 
+import rateLimit from 'express-rate-limit';
+
+// Create a rate limiter for the vulnerable endpoint
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15-minute window
+  max: 100, // Limit each IP to 100 requests per window
+  message: 'Too many requests, please try again later.',
+});
+
+
 const challengeUtils = require('../lib/challengeUtils')
 
 interface SnippetRequestBody {
@@ -38,29 +48,34 @@ export const retrieveCodeSnippet = async (challengeKey: string) => {
   return null
 }
 
-exports.serveCodeSnippet = () => async (req: Request<SnippetRequestBody, Record<string, unknown>, Record<string, unknown>>, res: Response, next: NextFunction) => {
-  try {
-    const snippetData = await retrieveCodeSnippet(req.params.challenge)
-    if (snippetData == null) {
-      res.status(404).json({ status: 'error', error: `No code challenge for challenge key: ${req.params.challenge}` })
-      return
+exports.serveCodeSnippet = () => [
+  limiter,
+  async (req: Request<SnippetRequestBody, Record<string, unknown>, Record<string, unknown>>, res: Response, next: NextFunction) => {
+    try {
+      const snippetData = await retrieveCodeSnippet(req.params.challenge);
+      if (snippetData == null) {
+        res.status(404).json({ status: 'error', error: `No code challenge for challenge key: ${req.params.challenge}` });
+        return;
+      }
+      res.status(200).json({ snippet: snippetData.snippet });
+    } catch (error) {
+      const statusCode = setStatusCode(error);
+      res.status(statusCode).json({ status: 'error', error: utils.getErrorMessage(error) });
     }
-    res.status(200).json({ snippet: snippetData.snippet })
-  } catch (error) {
-    const statusCode = setStatusCode(error)
-    res.status(statusCode).json({ status: 'error', error: utils.getErrorMessage(error) })
-  }
-}
+  },
+];
 
 export const retrieveChallengesWithCodeSnippet = async () => {
   const codeChallenges = await getCodeChallenges()
   return [...codeChallenges.keys()]
 }
 
-exports.serveChallengesWithCodeSnippet = () => async (req: Request, res: Response, next: NextFunction) => {
-  const codingChallenges = await retrieveChallengesWithCodeSnippet()
-  res.json({ challenges: codingChallenges })
-}
+exports.serveChallengesWithCodeSnippet = () => [
+  async (req: Request, res: Response, next: NextFunction) => {
+    const codingChallenges = await retrieveChallengesWithCodeSnippet();
+    res.json({ challenges: codingChallenges });
+  },
+];
 
 export const getVerdict = (vulnLines: number[], neutralLines: number[], selectedLines: number[]) => {
   if (selectedLines === undefined) return false
@@ -71,50 +86,59 @@ export const getVerdict = (vulnLines: number[], neutralLines: number[], selected
   return notOkLines.length === 0
 }
 
-exports.checkVulnLines = () => async (req: Request<Record<string, unknown>, Record<string, unknown>, VerdictRequestBody>, res: Response, next: NextFunction) => {
-  const key = req.body.key
-  let snippetData
-  try {
-    snippetData = await retrieveCodeSnippet(key)
-    if (snippetData == null) {
-      res.status(404).json({ status: 'error', error: `No code challenge for challenge key: ${key}` })
-      return
+exports.checkVulnLines = () => [
+  limiter,
+  async (req: Request<Record<string, unknown>, Record<string, unknown>, VerdictRequestBody>, res: Response, next: NextFunction) => {
+    const key = req.body.key;
+    let snippetData;
+    try {
+      snippetData = await retrieveCodeSnippet(key);
+      if (snippetData == null) {
+        res.status(404).json({ status: 'error', error: `No code challenge for challenge key: ${key}` });
+        return;
+      }
+    } catch (error) {
+      const statusCode = setStatusCode(error);
+      res.status(statusCode).json({ status: 'error', error: utils.getErrorMessage(error) });
+      return;
     }
-  } catch (error) {
-    const statusCode = setStatusCode(error)
-    res.status(statusCode).json({ status: 'error', error: utils.getErrorMessage(error) })
-    return
-  }
-  const vulnLines: number[] = snippetData.vulnLines
-  const neutralLines: number[] = snippetData.neutralLines
-  const selectedLines: number[] = req.body.selectedLines
-  const verdict = getVerdict(vulnLines, neutralLines, selectedLines)
-  let hint
-  if (fs.existsSync('./data/static/codefixes/' + key + '.info.yml')) {
-    const codingChallengeInfos = yaml.load(fs.readFileSync('./data/static/codefixes/' + key + '.info.yml', 'utf8'))
-    if (codingChallengeInfos?.hints) {
-      if (accuracy.getFindItAttempts(key) > codingChallengeInfos.hints.length) {
-        if (vulnLines.length === 1) {
-          hint = res.__('Line {{vulnLine}} is responsible for this vulnerability or security flaw. Select it and submit to proceed.', { vulnLine: vulnLines[0].toString() })
+    const vulnLines: number[] = snippetData.vulnLines;
+    const neutralLines: number[] = snippetData.neutralLines;
+    const selectedLines: number[] = req.body.selectedLines;
+    const verdict = getVerdict(vulnLines, neutralLines, selectedLines);
+    let hint;
+    if (fs.existsSync('./data/static/codefixes/' + key + '.info.yml')) {
+      const codingChallengeInfos = yaml.load(fs.readFileSync('./data/static/codefixes/' + key + '.info.yml', 'utf8'));
+      if (codingChallengeInfos?.hints) {
+        if (accuracy.getFindItAttempts(key) > codingChallengeInfos.hints.length) {
+          if (vulnLines.length === 1) {
+            hint = res.__(
+              'Line {{vulnLine}} is responsible for this vulnerability or security flaw. Select it and submit to proceed.',
+              { vulnLine: vulnLines[0].toString() }
+            );
+          } else {
+            hint = res.__(
+              'Lines {{vulnLines}} are responsible for this vulnerability or security flaw. Select them and submit to proceed.',
+              { vulnLines: vulnLines.toString() }
+            );
+          }
         } else {
-          hint = res.__('Lines {{vulnLines}} are responsible for this vulnerability or security flaw. Select them and submit to proceed.', { vulnLines: vulnLines.toString() })
+          const nextHint = codingChallengeInfos.hints[accuracy.getFindItAttempts(key) - 1]; // -1 prevents after first attempt
+          if (nextHint) hint = res.__(nextHint);
         }
-      } else {
-        const nextHint = codingChallengeInfos.hints[accuracy.getFindItAttempts(key) - 1] // -1 prevents after first attempt
-        if (nextHint) hint = res.__(nextHint)
       }
     }
-  }
-  if (verdict) {
-    await challengeUtils.solveFindIt(key)
-    res.status(200).json({
-      verdict: true
-    })
-  } else {
-    accuracy.storeFindItVerdict(key, false)
-    res.status(200).json({
-      verdict: false,
-      hint
-    })
-  }
-}
+    if (verdict) {
+      await challengeUtils.solveFindIt(key);
+      res.status(200).json({
+        verdict: true,
+      });
+    } else {
+      accuracy.storeFindItVerdict(key, false);
+      res.status(200).json({
+        verdict: false,
+        hint,
+      });
+    }
+  },
+];
